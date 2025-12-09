@@ -237,6 +237,17 @@ bool tryParseBoolValid(const char* json, bool &outValid) {
   if (strncmp(p, "false",5)==0)  { outValid = false; return true; }
   return false;
 }
+
+bool tryParseBoolCorrect(const char* json, bool &outCorrect) {
+  const char* p = strstr(json, "\"correct\"");
+  if (!p) return false;
+  p = strchr(p, ':'); if (!p) return false;
+  ++p; while (*p==' '||*p=='\t') ++p;
+  if (strncmp(p, "true", 4)==0)  { outCorrect = true;  return true; }
+  if (strncmp(p, "false",5)==0)  { outCorrect = false; return true; }
+  return false;
+}
+
 bool tryParseSeq(const char* json, uint32_t &outSeq) {
   const char* p = strstr(json, "\"seq\"");
   if (!p) return false;
@@ -249,39 +260,74 @@ bool tryParseSeq(const char* json, uint32_t &outSeq) {
 }
 
 void handleResponseLine() {
-  respBuf[respPos] = '\0';
+  respBuf[respPos] = '\0';   // termine la chaîne C
 
-  if (!strContains(respBuf, "\"event\":\"pin_result\"")) { respPos=0; return; }
+  // --- 1) Réponse de PIN ---
+  if (strContains(respBuf, "\"event\":\"pin_result\"")) {
 
-  bool isValid=false;
-  if (!tryParseBoolValid(respBuf, isValid)) { respPos=0; return; }
-
-  uint32_t gotSeq=0;
-  bool hasSeq = tryParseSeq(respBuf, gotSeq);
-  if (hasSeq) {
-    if (gotSeq != lastSentSeq || gotSeq <= lastHandledSeq) { respPos=0; return; }
-    lastHandledSeq = gotSeq; // dédoublonnage
-  }
-
-  // Réponse acceptée
-  waitingValidation=false; respPos=0; retryCount=0;
-
-  if (isValid) {
-    failedAttempts = 0;   // reset anti-brute
-    Beep(2000, 120);
-    doorOpenSequence();
-  } else {
-    failedAttempts++;
-    Beep(400, 150);
-    showMessage("CODE INVALIDE", "Reessayer", 1000);
-    if (failedAttempts >= MAX_ATTEMPTS) {
-      lockout = true; lockoutStart = millis();
-      showMessage("Trop d'essais", "Verrouillage...", 800);
-      // alerte sonore
-      EmmitBuzzer(600, 3, 150, 120);
+    // si on n'attend pas de validation, on ignore
+    if (!waitingValidation) {
+      respPos = 0;
+      return;
     }
+
+    bool isValid = false;
+    if (!tryParseBoolValid(respBuf, isValid)) {
+      respPos = 0;
+      return;
+    }
+
+    uint32_t gotSeq = 0;
+    bool hasSeq = tryParseSeq(respBuf, gotSeq);
+    if (hasSeq) {
+      if (gotSeq != lastSentSeq || gotSeq <= lastHandledSeq) {
+        respPos = 0;
+        return;
+      }
+      lastHandledSeq = gotSeq; // dédoublonnage
+    }
+
+    // Réponse PIN acceptée
+    waitingValidation = false;
+    respPos = 0;
+    retryCount = 0;
+
+    if (isValid) {
+      failedAttempts = 0;   // reset anti-brute
+      Beep(2000, 120);
+      doorOpenSequence();
+    } else {
+      failedAttempts++;
+      Beep(400, 150);
+      showMessage("CODE INVALIDE", "Reessayer", 1000);
+      if (failedAttempts >= MAX_ATTEMPTS) {
+        lockout = true; lockoutStart = millis();
+        showMessage("Trop d'essais", "Verrouillage...", 800);
+        // alerte sonore
+        EmmitBuzzer(600, 3, 150, 120);
+      }
+    }
+    startPinEntry();
+    return;
   }
-  startPinEntry();
+
+  // --- 2) Résultat d'objet (caméra) ---
+  if (strContains(respBuf, "\"event\":\"item_result\"")) {
+    bool isCorrect = false;
+    if (!tryParseBoolCorrect(respBuf, isCorrect)) {
+      respPos = 0;
+      return;
+    }
+
+    // Appelle ton hook de logique métier
+    onItemResult(isCorrect);
+
+    respPos = 0;
+    return;
+  }
+
+  // --- 3) Autres événements ignorés ---
+  respPos = 0;
 }
 
 void beginValidation() {
@@ -326,6 +372,16 @@ void selfTest() {
   lcd_1.clear();
 }
 
+void onItemResult(bool correct) {
+  if (correct) {
+    showMessage("Succès !", "Frisbee détecté", 1000);
+    servo_smooth_move(SERVO_OPEN_ANGLE, SERVO_CLOSED_ANGLE, SERVO_SWEEP_MS);
+  } else {
+    showMessage("Erreur", "Mauvais objet", 1500);
+    EmmitBuzzer(500, 2, 200, 200);
+  }
+}
+
 // ============ SETUP / LOOP ===================
 void setup() {
   // ✅ Empêcher un reset en boucle si WDT actif avant
@@ -352,9 +408,28 @@ void setup() {
   startPinEntry();
 }
 
+void pollSerial() {
+  while (Serial.available()) {
+    WDT_FEED();  // pour le watchdog
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      handleResponseLine();  // traite la ligne complète
+      break;
+    }
+    if (respPos < sizeof(respBuf) - 1) {
+      respBuf[respPos++] = c;
+    } else {
+      // overflow -> reset le buffer
+      respPos = 0;
+    }
+  }
+}
+
 void loop() {
   if (USE_WATCHDOG) wdt_reset();
 
+  pollSerial();
   unsigned long now = millis();
 
   // Backlight auto-sleep
@@ -379,28 +454,20 @@ void loop() {
   }
 
   // Phase attente réponse
-  if (waitingValidation) {
-    while (Serial.available()) {
-      WDT_FEED();  // ✅ nourrit le WDT pendant la lecture série
-      char c = (char)Serial.read();
-      if (c=='\r') continue;
-      if (c=='\n') { handleResponseLine(); break; }
-      if (respPos < sizeof(respBuf)-1) respBuf[respPos++] = c;
-      else respPos = 0; // overflow -> purge
+if (waitingValidation) {
+  if (waitingValidation && (now - waitStart > VALIDATION_TIMEOUT_MS)) {
+    if (retryCount < MAX_RETRIES) {
+      retryCount++; waitStart = now;
+      sendPinToPi(lastSentSeq); Beep(900, 80);
+    } else {
+      waitingValidation = false;
+      Beep(350, 180);
+      showMessage("Pas de reponse", "du Pi (timeout)", 1000);
+      startPinEntry();
     }
-    if (waitingValidation && (now - waitStart > VALIDATION_TIMEOUT_MS)) {
-      if (retryCount < MAX_RETRIES) {
-        retryCount++; waitStart = now;
-        sendPinToPi(lastSentSeq); Beep(900, 80);
-      } else {
-        waitingValidation=false;
-        Beep(350, 180);
-        showMessage("Pas de reponse", "du Pi (timeout)", 1000);
-        startPinEntry();
-      }
-    }
-    return;
   }
+  return;
+}
 
   // Inactivité saisie -> seulement si l'utilisateur a commencé à taper (pos > 0)
   if (canWrite && pos > 0 && (now - lastKeyTs > ENTRY_IDLE_TIMEOUT_MS)) {
